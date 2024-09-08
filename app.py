@@ -30,8 +30,7 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    password = db.Column(db.String(60), nullable=False)
-    jobs = db.relationship('Job', backref='user', lazy=True)
+    password = db.Column(db.String(255), nullable=False)  # Increased to 255 characters
 
 class Job(db.Model):
     id = db.Column(db.String(36), primary_key=True)
@@ -69,17 +68,23 @@ def home():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        user = User.query.filter_by(email=email).first()
-        if user:
-            flash('Email already registered.')
+        try:
+            email = request.form.get('email')
+            password = request.form.get('password')
+            user = User.query.filter_by(email=email).first()
+            if user:
+                flash('Email already registered.')
+                return redirect(url_for('register'))
+            new_user = User(email=email, password=generate_password_hash(password))
+            db.session.add(new_user)
+            db.session.commit()
+            flash('Registration successful. Please log in.')
+            return redirect(url_for('login'))
+        except Exception as e:
+            db.session.rollback()
+            app.logger.error(f"Registration error: {str(e)}")
+            flash(f"An error occurred during registration. Please try again.")
             return redirect(url_for('register'))
-        new_user = User(email=email, password=generate_password_hash(password))
-        db.session.add(new_user)
-        db.session.commit()
-        flash('Registration successful. Please log in.')
-        return redirect(url_for('login'))
     return render_template('register.html')
 
 @app.route('/login', methods=['GET', 'POST'])
