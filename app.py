@@ -3,22 +3,41 @@ import zipfile
 import tempfile
 import threading
 import uuid
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 import fal_client
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key'  # Change this!
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///site.db'
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
 
-# Use environment variable for FAL_KEY
 fal_client.api_key = os.environ.get('FAL_KEY')
 
-# Temporary storage for uploaded files
 UPLOAD_FOLDER = tempfile.mkdtemp()
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# Dictionary to store job statuses
-job_statuses = {}
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(20), unique=True, nullable=False)
+    password = db.Column(db.String(60), nullable=False)
+    jobs = db.relationship('Job', backref='user', lazy=True)
 
-def run_training_job(job_id, images_url):
+class Job(db.Model):
+    id = db.Column(db.String(36), primary_key=True)
+    status = db.Column(db.String(20), nullable=False, default='running')
+    model_url = db.Column(db.String(200))
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+def run_training_job(job_id, images_url, user_id):
     try:
         handler = fal_client.submit(
             "fal-ai/flux-lora-general-training",
@@ -28,15 +47,61 @@ def run_training_job(job_id, images_url):
         )
         result = handler.get()
         model_url = result['diffusers_lora_file']['url']
-        job_statuses[job_id] = {'status': 'completed', 'model_url': model_url}
+        job = Job.query.get(job_id)
+        job.status = 'completed'
+        job.model_url = model_url
+        db.session.commit()
     except Exception as e:
-        job_statuses[job_id] = {'status': 'failed', 'error': str(e)}
+        job = Job.query.get(job_id)
+        job.status = 'failed'
+        db.session.commit()
 
-@app.route('/', methods=['GET'])
-def index():
-    return render_template('index.html')
+@app.route('/')
+def home():
+    return render_template('home.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        user = User.query.filter_by(username=username).first()
+        if user:
+            flash('Username already exists.')
+            return redirect(url_for('register'))
+        new_user = User(username=username, password=generate_password_hash(password))
+        db.session.add(new_user)
+        db.session.commit()
+        return redirect(url_for('login'))
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        user = User.query.filter_by(username=username).first()
+        if user and check_password_hash(user.password, password):
+            login_user(user)
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid username or password.')
+    return render_template('login.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('home'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    jobs = Job.query.filter_by(user_id=current_user.id).all()
+    return render_template('dashboard.html', jobs=jobs)
 
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload_file():
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
@@ -52,31 +117,30 @@ def upload_file():
         return jsonify({'message': 'File uploaded successfully', 'filename': file.filename})
 
 @app.route('/train', methods=['POST'])
+@login_required
 def train():
     try:
         files = os.listdir(app.config['UPLOAD_FOLDER'])
         if not files:
             return jsonify({'error': 'No files uploaded'}), 400
 
-        # Create a zip file containing all uploaded images
         zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'images.zip')
         with zipfile.ZipFile(zip_path, 'w') as zip_file:
             for file in files:
                 file_path = os.path.join(app.config['UPLOAD_FOLDER'], file)
                 zip_file.write(file_path, file)
 
-        # Upload the zip file to fal storage
         with open(zip_path, 'rb') as f:
             url = fal_client.upload(f, "application/zip")
 
         job_id = str(uuid.uuid4())
-        job_statuses[job_id] = {'status': 'running'}
+        new_job = Job(id=job_id, user_id=current_user.id)
+        db.session.add(new_job)
+        db.session.commit()
         
-        # Start the training job in a background thread
-        thread = threading.Thread(target=run_training_job, args=(job_id, url))
+        thread = threading.Thread(target=run_training_job, args=(job_id, url, current_user.id))
         thread.start()
 
-        # Clean up: remove all uploaded files and the zip file
         for file in files:
             os.remove(os.path.join(app.config['UPLOAD_FOLDER'], file))
         os.remove(zip_path)
@@ -87,9 +151,14 @@ def train():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/job_status/<job_id>', methods=['GET'])
+@login_required
 def job_status(job_id):
-    status = job_statuses.get(job_id, {'status': 'not_found'})
-    return jsonify(status)
+    job = Job.query.get(job_id)
+    if job and job.user_id == current_user.id:
+        return jsonify({'status': job.status, 'model_url': job.model_url})
+    return jsonify({'status': 'not_found'}), 404
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
