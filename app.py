@@ -1,75 +1,42 @@
-import os
-import zipfile
-import tempfile
-from flask import Flask, render_template, request, jsonify
+import threading
+from flask import Flask, jsonify, request
 import fal_client
+import uuid
 
 app = Flask(__name__)
 
-# Use environment variable for FAL_KEY
-fal_client.api_key = os.environ.get('FAL_KEY')
+# Dictionary to store job statuses
+job_statuses = {}
 
-# Temporary storage for uploaded files
-UPLOAD_FOLDER = tempfile.mkdtemp()
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file part'})
-        
-        file = request.files['file']
-        
-        if file.filename == '':
-            return jsonify({'error': 'No selected file'})
-        
-        if file:
-            filename = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-            file.save(filename)
-            return jsonify({'message': 'File uploaded successfully', 'filename': file.filename})
-    
-    return render_template('index.html')
-
-@app.route('/train', methods=['POST'])
-def train():
-    files = os.listdir(app.config['UPLOAD_FOLDER'])
-    if not files:
-        return jsonify({'error': 'No files uploaded'})
-
-    # Create a zip file containing all uploaded images
-    zip_path = os.path.join(app.config['UPLOAD_FOLDER'], 'images.zip')
-    with zipfile.ZipFile(zip_path, 'w') as zip_file:
-        for file in files:
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], file)
-            zip_file.write(file_path, file)
-
-    # Upload the zip file to fal storage
-    with open(zip_path, 'rb') as f:
-        url = fal_client.upload(f, "application/zip")
-
-    # Call the API
+def run_training_job(job_id, images_url):
     try:
         handler = fal_client.submit(
             "fal-ai/flux-lora-general-training",
             arguments={
-                "images_data_url": url
+                "images_data_url": images_url
             },
         )
-
         result = handler.get()
-
-        # Extract the .safetensors file URL
         model_url = result['diffusers_lora_file']['url']
-
-        # Clean up: remove all uploaded files and the zip file
-        for file in files:
-            os.remove(os.path.join(app.config['UPLOAD_FOLDER'], file))
-        os.remove(zip_path)
-
-        return jsonify({'model_url': model_url})
+        job_statuses[job_id] = {'status': 'completed', 'model_url': model_url}
     except Exception as e:
-        return jsonify({'error': str(e)})
+        job_statuses[job_id] = {'status': 'failed', 'error': str(e)}
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+@app.route('/train', methods=['POST'])
+def train():
+    # Your existing code to create and upload zip file
+    # ...
+
+    job_id = str(uuid.uuid4())
+    job_statuses[job_id] = {'status': 'running'}
+    
+    # Start the training job in a background thread
+    thread = threading.Thread(target=run_training_job, args=(job_id, url))
+    thread.start()
+
+    return jsonify({'job_id': job_id, 'status': 'training_started'})
+
+@app.route('/job_status/<job_id>', methods=['GET'])
+def job_status(job_id):
+    status = job_statuses.get(job_id, {'status': 'not_found'})
+    return jsonify(status)
