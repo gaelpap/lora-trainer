@@ -10,6 +10,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_migrate import Migrate
 import fal_client
 from sqlalchemy import text
+import logging
+from itsdangerous import URLSafeTimedSerializer
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your_secret_key_here')
@@ -27,6 +29,15 @@ fal_client.api_key = os.environ.get('FAL_KEY')
 
 UPLOAD_FOLDER = tempfile.mkdtemp()
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Set up logging
+if not app.debug:
+    file_handler = logging.FileHandler('app.log')
+    file_handler.setLevel(logging.WARNING)
+    app.logger.addHandler(file_handler)
+
+# Initialize URL safe time serializer for generating reset tokens
+serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -100,7 +111,7 @@ def register():
             return redirect(url_for('login'))
         except Exception as e:
             db.session.rollback()
-            app.logger.error(f"Registration error for {email}: {str(e)}")
+            app.logger.error(f"Registration error for {email}: {str(e)}", exc_info=True)
             flash(f"An error occurred during registration. Please try again.")
             return redirect(url_for('register'))
     return render_template('register.html')
@@ -188,9 +199,44 @@ def job_status(job_id):
         return jsonify({'status': job.status, 'model_url': job.model_url})
     return jsonify({'status': 'not_found'}), 404
 
+@app.route('/reset_password', methods=['GET', 'POST'])
+def reset_password():
+    if request.method == 'POST':
+        email = request.form.get('email')
+        user = User.query.filter_by(email=email).first()
+        if user:
+            token = serializer.dumps(email, salt='email-confirm')
+            reset_url = url_for('reset_password_confirm', token=token, _external=True)
+            # Here you would typically send an email with the reset_url
+            # For now, we'll just flash the URL (not secure for production!)
+            flash(f'Password reset link: {reset_url}')
+            return redirect(url_for('login'))
+        flash('Email not found.')
+    return render_template('reset_password.html')
+
+@app.route('/reset_password_confirm/<token>', methods=['GET', 'POST'])
+def reset_password_confirm(token):
+    try:
+        email = serializer.loads(token, salt='email-confirm', max_age=3600)
+    except:
+        flash('The password reset link is invalid or has expired.')
+        return redirect(url_for('reset_password'))
+    
+    if request.method == 'POST':
+        user = User.query.filter_by(email=email).first()
+        new_password = request.form.get('password')
+        user.password = generate_password_hash(new_password)
+        db.session.commit()
+        flash('Your password has been updated.')
+        return redirect(url_for('login'))
+    
+    return render_template('reset_password_confirm.html')
+
 with app.app_context():
     db.create_all()
     alter_password_column()
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+else:
+    app.config['DEBUG'] = True
